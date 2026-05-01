@@ -1,14 +1,11 @@
 # Code strongly inspired: https://github.com/gatheluck/FourierHeatmap
-
 import torch
 from tqdm import tqdm
 import torch.fft as fft
 import matplotlib.pyplot as plt
-from typing import Iterator, Optional
 
 
-def get_spectrum(height: int, width: int, ignore_edge_size: int = 0, low_center: bool = True, ) -> Iterator[
-    torch.Tensor]:
+def get_spectrum(height: int, width: int, ignore_edge_size: int = 0, low_center: bool = True):
     total = height * width
     indices = torch.arange(total)
 
@@ -29,19 +26,10 @@ def get_spectrum(height: int, width: int, ignore_edge_size: int = 0, low_center:
         yield spectrum
 
 
-def spectrum_to_basis(
-        spectrum: torch.Tensor,
-        image_size: int,
-        device: torch.device,
-        l2_normalize: bool = True,
-) -> torch.Tensor:
+def spectrum_to_basis(spectrum: torch.Tensor, image_size: int, device: torch.device,
+                      l2_normalize: bool = True) -> torch.Tensor:
     spectrum = spectrum.to(device)
-
-    basis = fft.irfftn(
-        spectrum,
-        s=(image_size, image_size),
-        dim=(-2, -1),
-    )
+    basis = fft.irfftn(spectrum, s=(image_size, image_size), dim=(-2, -1))
 
     if l2_normalize:
         basis = basis / basis.norm()
@@ -61,10 +49,8 @@ def create_fourier_heatmap_from_error_matrix(error_matrix: torch.Tensor) -> torc
 
 
 @torch.no_grad()
-def fourier_heatmap(model, loader, device, image_size: int, v_perturb: float, ignore_edge_size: int = 0,
-                    max_batches: Optional[int] = None) -> torch.Tensor:
+def fourier_heatmap(model, loader, device, image_size, v_perturb, ignore_edge_size=0, max_batches=None) -> torch.Tensor:
     assert v_perturb > 0, "v_perturb must be > 0"
-
     model.eval()
 
     height = image_size
@@ -79,12 +65,7 @@ def fourier_heatmap(model, loader, device, image_size: int, v_perturb: float, ig
     with tqdm(spectrums, total=fhmap_height * fhmap_width, ncols=120) as pbar:
         for idx, spectrum in enumerate(pbar):
             # U_ij, norme L2 = 1
-            basis = spectrum_to_basis(
-                spectrum=spectrum,
-                image_size=image_size,
-                device=device,
-                l2_normalize=True,
-            )
+            basis = spectrum_to_basis(spectrum=spectrum, image_size=image_size, device=device, l2_normalize=True)
             basis = basis.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
 
             total = 0
@@ -131,7 +112,80 @@ def save_heatmap(heatmap: torch.Tensor, path: str):
     plt.figure(figsize=(6, 6))
     plt.imshow(heatmap, cmap="jet", vmin=0.0, vmax=1.0)
     plt.colorbar(label="Error rate")
-    plt.title("Fourier Heat Map")
+    plt.title("Fourier heatmap")
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+
+def get_frequency_region_masks(heatmap: torch.Tensor, low_radius_ratio: float = 0.20, mid_radius_ratio: float = 0.60):
+    assert 0.0 < low_radius_ratio < mid_radius_ratio < 1.0
+
+    height, width = heatmap.shape
+    center_y = (height - 1) / 2.0
+    center_x = (width - 1) / 2.0
+
+    yy, xx = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32),
+        torch.arange(width, dtype=torch.float32),
+        indexing="ij",
+    )
+    radius = torch.sqrt((yy - center_y) ** 2 + (xx - center_x) ** 2)
+    radius = radius / radius.max()
+
+    low_mask = radius <= low_radius_ratio
+    mid_mask = (radius > low_radius_ratio) & (radius <= mid_radius_ratio)
+    high_mask = radius > mid_radius_ratio
+    all_mask = torch.ones_like(low_mask, dtype=torch.bool)
+
+    return {
+        "all": all_mask,
+        "low": low_mask,
+        "mid": mid_mask,
+        "high": high_mask,
+    }
+
+
+def summarize_frequency_sensitivity(heatmap: torch.Tensor, low_radius_ratio, mid_radius_ratio):
+    heatmap = heatmap.detach().cpu().float()
+    masks = get_frequency_region_masks(heatmap=heatmap, low_radius_ratio=low_radius_ratio,
+                                       mid_radius_ratio=mid_radius_ratio)
+
+    summary = {}
+    for region_name, mask in masks.items():
+        values = heatmap[mask]
+        summary[region_name] = {
+            "mean_error": values.mean().item(),
+            "std_error": values.std(unbiased=False).item(),
+            "num_frequencies": int(values.numel()),
+        }
+
+    return summary
+
+
+def save_frequency_summary_plot(summary_by_model, path: str):
+    """
+    Chatgpt (boring plot)
+    """
+
+    regions = ["low", "mid", "high"]
+    models = list(summary_by_model.keys())
+
+    x = torch.arange(len(regions), dtype=torch.float32)
+    width = 0.8 / max(len(models), 1)
+
+    plt.figure(figsize=(7, 4))
+    for model_idx, model_name in enumerate(models):
+        values = [summary_by_model[model_name][region]["mean_error"] for region in regions]
+        offset = (model_idx - (len(models) - 1) / 2.0) * width
+        plt.bar((x + offset).numpy(), values, width=width, label=model_name)
+
+    plt.xticks(x.numpy(), regions)
+    plt.ylabel("Average error rate")
+    plt.xlabel("Frequency region")
+    plt.ylim(0.0, 1.0)
+    plt.title("Low vs mid vs high fourier sensitivity")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(path, dpi=200)
     plt.close()
